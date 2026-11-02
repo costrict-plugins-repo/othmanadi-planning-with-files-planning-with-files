@@ -1,0 +1,51 @@
+# skill-lens configuration for the planning-with-files evals.
+# Secrets never live here: OPENAI_API_KEY and CLAUDE_CODE_OAUTH_TOKEN (or
+# ANTHROPIC_API_KEY) come from the environment. Claude Code runs with a
+# temporary home directory, so the login saved in your own home is not used.
+
+# docs/skill-lens.md explains the run and the results. Overridden per run
+# with --runner.
+default_runner = "claude-code"
+
+# Model for the pydantic-ai runner. gpt-6-luna accepts only its default
+# temperature, so skill-lens must not send one.
+model = "openai:gpt-6-luna"
+temperature = "unset"
+
+# One judge for every runner. It is from a different provider than the
+# claude-code runner; for the pydantic-ai runner it is the same model as
+# the one under test. With only Claude Code (CLAUDE_CODE_OAUTH_TOKEN or
+# ANTHROPIC_API_KEY, and no OPENAI_API_KEY), use judge = "claude-code"
+# instead and drop the three judge/model keys.
+judge = "pydantic-ai"
+judge_model = "openai:gpt-6-luna"
+judge_temperature = "unset"
+
+min_pass_rate = 1.0
+
+# Let framework runners (pydantic-ai) run the skill's own scripts through
+# skill-lens's run_script tool, so they can follow the skill's setup step
+# (scripts/init-session.sh), as Claude Code does through its shell. The
+# scripts run in skill-lens's sandbox (sandbox-exec on macOS, bwrap on Linux).
+allow_scripts = true
+script_sandbox = "required"
+
+# Run Claude Code (the runner, and the judge when judge = "claude-code") with
+# a temporary home directory and an allowlisted environment, inside
+# sandbox-exec on macOS or bwrap on Linux. "required" refuses to start when
+# neither works, instead of falling back to a run with no sandbox.
+product_sandbox = "required"
+
+# Stop the whole run once its recorded spend reaches this many US dollars:
+# every run and every judge call, both arms, errored runs included. Cases
+# already running finish; the rest are reported as not run, and the gate
+# fails. The run in docs/skill-lens.md, both cases, cost $5.87.
+max_spend_usd = 10.00
+
+concurrency = 2
+
+[runners.claude-code]
+# Same model as Test 1 in docs/evals.md. --max-budget-usd stops one run's
+# spending; a run that hits it is reported as errored.
+args = ["--model", "claude-sonnet-4-6", "--max-budget-usd", "1.00"]
+timeout_seconds = 600.0
