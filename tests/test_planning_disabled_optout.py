@@ -1,0 +1,685 @@
+"""Issue #195: PLANNING_DISABLED=1 per-invocation opt-out.
+
+A one-shot session (codex exec, CI bot, sub-orchestrator) that merely shares a
+cwd with an incomplete plan must be able to opt out of every hook: no plan
+injection, no stop followup, no plan-file mutation. These tests run the real
+hook scripts in a temp dir containing a legacy root task_plan.md (the exact
+attachment path the issue reports) with and without the env var.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+CODEX_HOOKS = REPO / ".codex" / "hooks"
+COPILOT_HOOKS = REPO / ".github" / "hooks" / "scripts"
+CURSOR_HOOKS = REPO / ".cursor" / "hooks"
+GEMINI_HOOKS = REPO / ".gemini" / "hooks"
+SCRIPTS = REPO / "scripts"
+POWERSHELL = (
+    shutil.which("pwsh")
+    or shutil.which("powershell.exe")
+    or shutil.which("powershell")
+)
+
+SH = shutil.which("sh")
+BASH = (
+    shutil.which("bash", path=str(Path(SH).parent))
+    if os.name == "nt" and SH
+    else shutil.which("bash")
+)
+
+
+def shell_python_is_usable() -> bool:
+    if not BASH:
+        return False
+    result = subprocess.run(
+        [BASH, "-c", 'PY=$(command -v python3 || command -v python); [ -n "$PY" ] && "$PY" -I -c "import json"'],
+        capture_output=True, text=True, timeout=10,
+    )
+    return result.returncode == 0
+
+
+PLAN = "# Test Plan\n### Phase 1: something\n**Status:** in_progress\n"
+
+
+def run_sh(
+    script: Path, cwd: Path, disabled: bool, input_data: str = ""
+) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.pop("PLANNING_DISABLED", None)
+    if disabled:
+        env["PLANNING_DISABLED"] = "1"
+    return subprocess.run(
+        ["sh", str(script)],
+        cwd=str(cwd),
+        env=env,
+        input=input_data,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+
+def run_powershell(
+    script: Path, cwd: Path, disabled: bool
+) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.pop("PLANNING_DISABLED", None)
+    if disabled:
+        env["PLANNING_DISABLED"] = "1"
+    return subprocess.run(
+        [
+            str(POWERSHELL),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+        ],
+        cwd=str(cwd),
+        env=env,
+        input='{"error":{"message":"fixture failure"}}',
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+
+
+# Scratch trees under the gitignored .planning/ are not shipped (#352).
+_EXCLUDED_PARTS = {".planning", ".git", "node_modules", "__pycache__"}
+
+
+@contextlib.contextmanager
+def ignored_scratch_dir():
+    """Unique directory under the gitignored .planning/; removes only what it made."""
+    planning = REPO / ".planning"
+    created_planning = not planning.exists()
+    planning.mkdir(exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix="_pwf352_", dir=planning))
+    try:
+        yield scratch
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+        if created_planning:
+            try:
+                planning.rmdir()
+            except OSError:
+                pass
+
+
+def shipped_check_complete_copies() -> list[Path]:
+    """Tracked check-complete helpers; filtered walk only without git metadata.
+
+    A stale foreign copy under ignored `.planning/` must not fail validation
+    of the shipped inventory (#352), matching the session-catchup approach (#274).
+    A tracked helper is always shipped, wherever it lives, so the exclusions apply
+    to the walk only.
+    """
+    names = {"check-complete.sh", "check-complete.ps1"}
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.quotepath=off",
+                "ls-files",
+                "--",
+                "*check-complete.sh",
+                "*check-complete.ps1",
+            ],
+            cwd=str(REPO),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        proc = None
+    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+        candidates = [REPO / line for line in proc.stdout.splitlines() if line]
+        # Optional gitignored publish staging stays validated when present.
+        candidates += list((REPO / "clawhub-upload" / "scripts").glob("check-complete.*"))
+        return sorted(path for path in candidates if path.is_file() and path.name in names)
+    return sorted(
+        path
+        for name in names
+        for path in REPO.rglob(name)
+        if path.is_file() and not _EXCLUDED_PARTS.intersection(path.relative_to(REPO).parts)
+    )
+
+
+class PlanningDisabledOptOutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name)
+        (self.cwd / "task_plan.md").write_text(PLAN, encoding="utf-8")
+        (self.cwd / "progress.md").write_text("progress line\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    # --- Codex hooks (the platform #195 reports against) ---
+
+    def test_codex_user_prompt_submit_stays_silent_when_disabled(self) -> None:
+        baseline = run_sh(CODEX_HOOKS / "user-prompt-submit.sh", self.cwd, disabled=False)
+        self.assertIn("ACTIVE PLAN", baseline.stdout)
+        disabled = run_sh(CODEX_HOOKS / "user-prompt-submit.sh", self.cwd, disabled=True)
+        self.assertEqual(disabled.stdout.strip(), "")
+        self.assertEqual(disabled.returncode, 0)
+
+    def test_codex_stop_emits_no_followup_when_disabled(self) -> None:
+        baseline = run_sh(CODEX_HOOKS / "stop.sh", self.cwd, disabled=False)
+        self.assertIn("followup_message", baseline.stdout)
+        disabled = run_sh(CODEX_HOOKS / "stop.sh", self.cwd, disabled=True)
+        self.assertEqual(disabled.stdout.strip(), "")
+        self.assertEqual(disabled.returncode, 0)
+
+    def test_codex_pre_tool_use_still_allows_but_skips_context(self) -> None:
+        disabled = run_sh(CODEX_HOOKS / "pre-tool-use.sh", self.cwd, disabled=True)
+        self.assertIn('"decision": "allow"', disabled.stdout)
+        self.assertEqual(disabled.stderr.strip(), "")
+
+    def test_codex_post_tool_use_stays_silent_when_disabled(self) -> None:
+        disabled = run_sh(CODEX_HOOKS / "post-tool-use.sh", self.cwd, disabled=True)
+        self.assertEqual(disabled.stdout.strip(), "")
+
+    def test_codex_session_start_stays_silent_when_disabled(self) -> None:
+        disabled = run_sh(CODEX_HOOKS / "session-start.sh", self.cwd, disabled=True)
+        self.assertEqual(disabled.stdout.strip(), "")
+
+    def test_codex_pre_compact_stays_silent_when_disabled(self) -> None:
+        disabled = run_sh(CODEX_HOOKS / "pre-compact.sh", self.cwd, disabled=True)
+        self.assertEqual(disabled.stdout.strip(), "")
+
+    def test_codex_adapter_reports_not_attached_when_disabled(self) -> None:
+        sys.path.insert(0, str(CODEX_HOOKS))
+        try:
+            import codex_hook_adapter as adapter
+        finally:
+            sys.path.pop(0)
+        old = os.environ.pop("PLANNING_DISABLED", None)
+        try:
+            self.assertTrue(adapter.is_session_attached(self.cwd, None))
+            os.environ["PLANNING_DISABLED"] = "1"
+            self.assertFalse(adapter.is_session_attached(self.cwd, None))
+        finally:
+            os.environ.pop("PLANNING_DISABLED", None)
+            if old is not None:
+                os.environ["PLANNING_DISABLED"] = old
+
+    # --- Canonical dispatchers (Claude Code and mirrors) ---
+
+    def test_inject_plan_stays_silent_when_disabled(self) -> None:
+        baseline = run_sh(SCRIPTS / "inject-plan.sh", self.cwd, disabled=False)
+        self.assertIn("ACTIVE PLAN", baseline.stdout)
+        disabled = run_sh(SCRIPTS / "inject-plan.sh", self.cwd, disabled=True)
+        self.assertEqual(disabled.stdout.strip(), "")
+
+    def test_gate_stop_stays_silent_when_disabled(self) -> None:
+        disabled = run_sh(SCRIPTS / "gate-stop.sh", self.cwd, disabled=True)
+        self.assertEqual(disabled.stdout.strip(), "")
+        self.assertEqual(disabled.returncode, 0)
+
+    def test_check_complete_stays_silent_when_disabled(self) -> None:
+        baseline = run_sh(SCRIPTS / "check-complete.sh", self.cwd, disabled=False)
+        self.assertNotEqual(baseline.stdout.strip(), "")
+        disabled = run_sh(SCRIPTS / "check-complete.sh", self.cwd, disabled=True)
+        self.assertEqual(disabled.stdout.strip(), "")
+
+    # --- Acceptance criterion from #195: plan files byte-for-byte unchanged ---
+
+    def test_plan_files_unchanged_after_disabled_hook_pass(self) -> None:
+        for script in [
+            CODEX_HOOKS / "session-start.sh",
+            CODEX_HOOKS / "user-prompt-submit.sh",
+            CODEX_HOOKS / "pre-tool-use.sh",
+            CODEX_HOOKS / "post-tool-use.sh",
+            CODEX_HOOKS / "stop.sh",
+            CODEX_HOOKS / "pre-compact.sh",
+            SCRIPTS / "inject-plan.sh",
+            SCRIPTS / "gate-stop.sh",
+            SCRIPTS / "check-complete.sh",
+        ]:
+            run_sh(script, self.cwd, disabled=True)
+        self.assertEqual((self.cwd / "task_plan.md").read_text(encoding="utf-8"), PLAN)
+        self.assertEqual(
+            (self.cwd / "progress.md").read_text(encoding="utf-8"), "progress line\n"
+        )
+
+    def test_copilot_shell_hooks_skip_context_when_disabled(self) -> None:
+        # Each hook is run twice against the same fixture. Asserting only the
+        # disabled run would pass against a fleet of hooks that emit {} no
+        # matter what, which is the silent-death class this repo has shipped
+        # twice, so the enabled run is the anti-vacuity baseline: it has to
+        # produce the context that the disabled run must not.
+        live = 0
+        for name in (
+            "session-start.sh",
+            "pre-tool-use.sh",
+            "post-tool-use.sh",
+            "agent-stop.sh",
+            "error-occurred.sh",
+        ):
+            with self.subTest(hook=name):
+                enabled = run_sh(
+                    COPILOT_HOOKS / name,
+                    self.cwd,
+                    disabled=False,
+                    input_data='{"error":{"message":"fixture failure"}}',
+                )
+                self.assertEqual(0, enabled.returncode, enabled.stderr)
+                # sessionStart and postToolUse return additionalContext at the
+                # top level; the other Copilot hooks still nest it.
+                enabled_payload = json.loads(enabled.stdout.lstrip("\ufeff"))
+                enabled_output = enabled_payload.get(
+                    "hookSpecificOutput", enabled_payload
+                )
+                if "additionalContext" in enabled_output:
+                    live += 1
+
+                result = run_sh(
+                    COPILOT_HOOKS / name,
+                    self.cwd,
+                    disabled=True,
+                    input_data='{"error":{"message":"fixture failure"}}',
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                payload = json.loads(result.stdout.lstrip("\ufeff"))
+                # Disabled means no opinion: no context, and for PreToolUse no
+                # permission decision either, so Copilot's own flow decides.
+                self.assertEqual({}, payload)
+
+        # pre-tool-use intentionally emits {} (no PreToolUse context API).
+        # error-occurred.sh JSON-escapes through python3 and goes quiet where
+        # that probe finds nothing, so three is the floor among the remaining
+        # context-bearing hooks.
+        self.assertGreaterEqual(
+            live,
+            3,
+            "no Copilot shell hook produced context with the opt-out unset; "
+            "the disabled-run assertions above cannot mean anything",
+        )
+
+    # --- Every distributed copy carries the guard ---
+
+    def test_all_check_complete_copies_carry_the_guard(self) -> None:
+        copies = shipped_check_complete_copies()
+        self.assertGreater(len(copies), 10)
+        for copy in copies:
+            text = copy.read_text(encoding="utf-8", errors="replace")
+            self.assertIn(
+                "PLANNING_DISABLED",
+                text,
+                f"missing opt-out guard: {copy.relative_to(REPO)}",
+            )
+
+    def test_optional_clawhub_staging_stays_in_the_inventory(self) -> None:
+        """Staged copies are validated on the tracked route and the no-Git walk (#352)."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            tracked = root / "skills" / "demo" / "scripts" / "check-complete.sh"
+            staged = root / "clawhub-upload" / "scripts" / "check-complete.sh"
+            scratch = root / ".planning" / "old" / "check-complete.sh"
+            for path in (tracked, staged, scratch):
+                path.parent.mkdir(parents=True)
+                path.write_text("#!/bin/sh\n", encoding="utf-8")
+            listing = subprocess.CompletedProcess(
+                [], 0, stdout="skills/demo/scripts/check-complete.sh\n", stderr=""
+            )
+            with mock.patch(f"{__name__}.REPO", root):
+                with mock.patch("subprocess.run", return_value=listing):
+                    self.assertEqual(shipped_check_complete_copies(), sorted([tracked, staged]))
+                with mock.patch("subprocess.run", side_effect=OSError("no git")):
+                    self.assertEqual(shipped_check_complete_copies(), sorted([tracked, staged]))
+
+    def test_tracked_helper_under_planning_stays_in_the_inventory(self) -> None:
+        """Only ignored scratch is excluded; a force-tracked helper is still shipped."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            kept = root / ".planning" / "kept" / "check-complete.sh"
+            kept.parent.mkdir(parents=True)
+            kept.write_text("#!/bin/sh\n", encoding="utf-8")
+            listing = subprocess.CompletedProcess(
+                [], 0, stdout=".planning/kept/check-complete.sh\n", stderr=""
+            )
+            with mock.patch(f"{__name__}.REPO", root), mock.patch(
+                "subprocess.run", return_value=listing
+            ):
+                self.assertEqual(shipped_check_complete_copies(), [kept])
+
+    def test_failed_git_listing_falls_back_to_the_filtered_walk(self) -> None:
+        """A source archive has git but no repository: rc 128 must not empty the list."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            shipped = root / ".agents" / "scripts" / "check-complete.sh"
+            scratch = root / ".planning" / "old" / "check-complete.sh"
+            for path in (shipped, scratch):
+                path.parent.mkdir(parents=True)
+                path.write_text("#!/bin/sh\n", encoding="utf-8")
+            not_a_repo = subprocess.CompletedProcess([], 128, stdout="", stderr="not a repository")
+            with mock.patch(f"{__name__}.REPO", root), mock.patch(
+                "subprocess.run", return_value=not_a_repo
+            ):
+                self.assertEqual(shipped_check_complete_copies(), [shipped])
+
+    def test_ignored_scratch_check_complete_does_not_join_shipped_inventory(self) -> None:
+        with ignored_scratch_dir() as scratch:
+            bad = scratch / "check-complete.sh"
+            bad.write_text("#!/bin/sh\necho no guard\n", encoding="utf-8")
+            copies = shipped_check_complete_copies()
+            self.assertNotIn(bad.resolve(), {c.resolve() for c in copies})
+            for copy in copies:
+                text = copy.read_text(encoding="utf-8", errors="replace")
+                self.assertIn("PLANNING_DISABLED", text)
+
+    def test_no_git_fallback_keeps_adapters_and_excludes_scratch(self) -> None:
+        """Without Git metadata, the walk still validates adapters and skips scratch."""
+        from unittest import mock
+
+        with ignored_scratch_dir() as scratch:
+            bad = scratch / "check-complete.sh"
+            bad.write_text("#!/bin/sh\necho no guard\n", encoding="utf-8")
+            with mock.patch("subprocess.run", side_effect=OSError("no git")):
+                copies = shipped_check_complete_copies()
+            resolved = {c.resolve() for c in copies}
+            self.assertNotIn(bad.resolve(), resolved)
+            self.assertGreater(len(copies), 10)
+            rel_roots = {c.relative_to(REPO).parts[0] for c in copies}
+            # Hidden adapter trees must remain discoverable.
+            self.assertLessEqual({".agents", ".codex", ".cursor"}, rel_roots)
+            for copy in copies:
+                text = copy.read_text(encoding="utf-8", errors="replace")
+                self.assertIn("PLANNING_DISABLED", text)
+
+
+@unittest.skipUnless(POWERSHELL, "PowerShell is not available")
+class CopilotPowerShellPlanningDisabledTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name)
+        (self.cwd / "task_plan.md").write_text(PLAN, encoding="utf-8")
+        (self.cwd / "progress.md").write_text("progress line\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_copilot_powershell_hooks_skip_context_when_disabled(self) -> None:
+        # None of the five PowerShell hooks shells out to escape JSON, so every
+        # one of them must produce context with the opt-out unset. A hook that
+        # goes quiet in both runs is dead, not disabled.
+        for name in (
+            "session-start.ps1",
+            "pre-tool-use.ps1",
+            "post-tool-use.ps1",
+            "agent-stop.ps1",
+            "error-occurred.ps1",
+        ):
+            with self.subTest(hook=name):
+                enabled = run_powershell(
+                    COPILOT_HOOKS / name, self.cwd, disabled=False
+                )
+                self.assertEqual(0, enabled.returncode, enabled.stderr)
+                enabled_payload = json.loads(enabled.stdout.lstrip("\ufeff"))
+                if name == "pre-tool-use.ps1":
+                    # PreToolUse has no documented plan-context transport.
+                    self.assertEqual({}, enabled_payload)
+                else:
+                    # sessionStart and postToolUse return additionalContext at
+                    # the top level; the other Copilot hooks still nest it.
+                    enabled_output = enabled_payload.get(
+                        "hookSpecificOutput", enabled_payload
+                    )
+                    self.assertIn(
+                        "additionalContext",
+                        enabled_output,
+                        f"{name} emitted no context with the opt-out unset, so "
+                        "the disabled-run assertion below proves nothing",
+                    )
+
+                result = run_powershell(
+                    COPILOT_HOOKS / name, self.cwd, disabled=True
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                payload = json.loads(result.stdout.lstrip("\ufeff"))
+                # Disabled means no opinion: no context, and for PreToolUse no
+                # permission decision either, so Copilot's own flow decides.
+                self.assertEqual({}, payload)
+
+
+CURSOR_HOOK_NAMES = (
+    "session-start",
+    "pre-tool-use",
+    "post-tool-use",
+    "stop",
+    "user-prompt-submit",
+)
+
+
+class CursorPlanningDisabledTests(unittest.TestCase):
+    """Cursor hook opt-out responses stay valid for their event schemas.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name)
+        (self.cwd / "task_plan.md").write_text(PLAN, encoding="utf-8")
+        (self.cwd / "progress.md").write_text("progress line\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _expected_disabled(self, name: str) -> str:
+        return {
+            "session-start": "{}",
+            "pre-tool-use": '{"permission":"allow"}',
+            "post-tool-use": "{}",
+        }.get(name, "")
+
+    def test_cursor_shell_hooks_go_inert_when_disabled(self) -> None:
+        for name in CURSOR_HOOK_NAMES:
+            with self.subTest(hook=f"{name}.sh"):
+                script = CURSOR_HOOKS / f"{name}.sh"
+                enabled = run_sh(script, self.cwd, disabled=False)
+                disabled = run_sh(script, self.cwd, disabled=True)
+                self.assertEqual(0, enabled.returncode, enabled.stderr)
+                self.assertEqual(0, disabled.returncode, disabled.stderr)
+                inert = self._expected_disabled(name)
+                if name == "pre-tool-use":
+                    # Permission hooks must always return an allow response;
+                    # the opt-out only affects injected plan context.
+                    self.assertEqual(inert, disabled.stdout.strip())
+                    self.assertEqual(inert, enabled.stdout.strip())
+                    continue
+                self.assertNotEqual(
+                    inert,
+                    (enabled.stdout + enabled.stderr).strip(),
+                    f"{name}.sh produced its inert output with the opt-out "
+                    "unset, so the disabled assertion below proves nothing",
+                )
+                self.assertEqual(
+                    inert, (disabled.stdout + disabled.stderr).strip()
+                )
+
+    @unittest.skipUnless(POWERSHELL, "PowerShell is not available")
+    def test_cursor_powershell_hooks_go_inert_when_disabled(self) -> None:
+        for name in CURSOR_HOOK_NAMES:
+            with self.subTest(hook=f"{name}.ps1"):
+                script = CURSOR_HOOKS / f"{name}.ps1"
+                enabled = run_powershell(script, self.cwd, disabled=False)
+                disabled = run_powershell(script, self.cwd, disabled=True)
+                self.assertEqual(0, enabled.returncode, enabled.stderr)
+                self.assertEqual(0, disabled.returncode, disabled.stderr)
+                inert = self._expected_disabled(name)
+                if name == "pre-tool-use":
+                    self.assertEqual(inert, disabled.stdout.strip().lstrip("﻿"))
+                    self.assertEqual(inert, enabled.stdout.strip().lstrip("﻿"))
+                    continue
+                self.assertNotEqual(
+                    inert,
+                    (enabled.stdout + enabled.stderr).strip().lstrip("﻿"),
+                    f"{name}.ps1 produced its inert output with the opt-out "
+                    "unset, so the disabled assertion below proves nothing",
+                )
+                self.assertEqual(
+                    inert,
+                    (disabled.stdout + disabled.stderr).strip().lstrip("﻿"),
+                )
+
+    @unittest.skipUnless(POWERSHELL, "PowerShell is not available")
+    def test_cursor_stop_ps1_is_silent_on_an_unstructured_plan(self) -> None:
+        # issue #191, the copy the fix never reached. stop.sh has carried the
+        # zero-phase guard since v3.2.0; stop.ps1 answered "0/0 phases done"
+        # and auto-continued on a plan that was never phase-structured.
+        (self.cwd / "task_plan.md").write_text(
+            "# Notes\n\nThis file has no phase structure.\n", encoding="utf-8"
+        )
+        result = run_powershell(CURSOR_HOOKS / "stop.ps1", self.cwd, disabled=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", (result.stdout + result.stderr).strip().lstrip("﻿"))
+
+
+
+class GeminiPlanningDisabledOptOutTests(unittest.TestCase):
+    """Issue #329: Gemini lifecycle hooks ignored PLANNING_DISABLED=1."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name)
+        self.plan = (
+            "# OPT_OUT_PROBE\n### Phase 1\n**Status:** in_progress\n"
+        )
+        (self.cwd / "task_plan.md").write_text(self.plan, encoding="utf-8")
+        (self.cwd / "progress.md").write_text("progress line\n", encoding="utf-8")
+        (self.cwd / "findings.md").write_text("findings line\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run(self, name: str, disabled: bool) -> subprocess.CompletedProcess:
+        # Gemini hooks use bashisms (here-strings); match test_gemini_hook_contract.
+        if not BASH:
+            self.skipTest("bash is not available")
+        env = dict(os.environ)
+        env.pop("PLANNING_DISABLED", None)
+        env["GEMINI_PROJECT_DIR"] = self.cwd.as_posix()
+        if disabled:
+            env["PLANNING_DISABLED"] = "1"
+        return subprocess.run(
+            [BASH, str(GEMINI_HOOKS / name)],
+            cwd=str(self.cwd),
+            env=env,
+            input="{}",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+    def test_gemini_hooks_emit_empty_object_when_disabled(self) -> None:
+        for name in ("session-start.sh", "before-agent.sh", "after-tool.sh", "session-end.sh"):
+            with self.subTest(hook=name):
+                disabled = self._run(name, disabled=True)
+                self.assertEqual(0, disabled.returncode, disabled.stderr)
+                self.assertEqual("{}", disabled.stdout.strip())
+
+    def test_gemini_enabled_context_controls(self) -> None:
+        for name in ("session-start.sh", "after-tool.sh"):
+            with self.subTest(hook=name):
+                enabled = self._run(name, disabled=False)
+                self.assertEqual(0, enabled.returncode, enabled.stderr)
+                self.assertNotEqual("{}", enabled.stdout.strip())
+
+    def test_gemini_before_agent_enabled_context(self) -> None:
+        if not shell_python_is_usable():
+            self.skipTest("shell Python is not usable")
+        enabled = self._run("before-agent.sh", disabled=False)
+        self.assertEqual(0, enabled.returncode, enabled.stderr)
+        self.assertIn("OPT_OUT_PROBE", json.loads(enabled.stdout)["hookSpecificOutput"]["additionalContext"])
+
+    def _install_sentinel(self, name: str, source: str) -> Path:
+        scripts = self.cwd / ".gemini/skills/planning-with-files/scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        (scripts / name).write_text(source, encoding="utf-8")
+        return self.cwd / "sentinel-called"
+
+    def test_session_start_disabled_does_not_invoke_catchup(self) -> None:
+        sentinel = self._install_sentinel(
+            "session-catchup.py",
+            'from pathlib import Path\nPath("sentinel-called").write_text("called")\nprint("CATCHUP_SENTINEL")\n',
+        )
+        result = self._run("session-start.sh", disabled=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("{}", result.stdout.strip())
+        self.assertFalse(sentinel.exists())
+
+    def test_session_start_enabled_invokes_catchup(self) -> None:
+        if not shell_python_is_usable():
+            self.skipTest("shell Python is not usable")
+        sentinel = self._install_sentinel(
+            "session-catchup.py",
+            'from pathlib import Path\nPath("sentinel-called").write_text("called")\nprint("CATCHUP_SENTINEL")\n',
+        )
+        result = self._run("session-start.sh", disabled=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(sentinel.exists())
+        self.assertIn("CATCHUP_SENTINEL", result.stdout)
+
+    def test_session_end_disabled_does_not_invoke_checker(self) -> None:
+        sentinel = self._install_sentinel("check-complete.sh", 'touch sentinel-called\n')
+        disabled = self._run("session-end.sh", disabled=True)
+        self.assertEqual(0, disabled.returncode, disabled.stderr)
+        self.assertEqual("{}", disabled.stdout.strip())
+        self.assertFalse(sentinel.exists())
+        enabled = self._run("session-end.sh", disabled=False)
+        self.assertEqual(0, enabled.returncode, enabled.stderr)
+        self.assertTrue(sentinel.exists())
+
+    def test_gemini_disabled_pass_leaves_plan_files_unchanged(self) -> None:
+        before = {
+            path.name: path.read_bytes()
+            for path in self.cwd.iterdir()
+            if path.is_file()
+        }
+        for name in ("session-start.sh", "before-agent.sh", "after-tool.sh", "session-end.sh"):
+            result = self._run(name, disabled=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("{}", result.stdout.strip())
+        after = {
+            path.name: path.read_bytes()
+            for path in self.cwd.iterdir()
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_gemini_hooks_stay_empty_without_a_plan(self) -> None:
+        (self.cwd / "task_plan.md").unlink()
+        for name in ("session-start.sh", "before-agent.sh", "after-tool.sh", "session-end.sh"):
+            with self.subTest(hook=name):
+                enabled = self._run(name, disabled=False)
+                self.assertEqual(0, enabled.returncode, enabled.stderr)
+                self.assertEqual("{}", enabled.stdout.strip())
+
+
+if __name__ == "__main__":
+    unittest.main()
